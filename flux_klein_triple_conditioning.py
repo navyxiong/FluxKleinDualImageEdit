@@ -1,7 +1,20 @@
+# flux_klein_triple_conditioning.py
 import torch
 import numpy as np
 from PIL import Image
-import comfy.model_management
+import sys
+import os
+
+# 确保能导入comfy相关模块
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..'))
+
+try:
+    import comfy.model_management
+    import folder_paths
+    from comfy.model_management import get_torch_device
+except ImportError as e:
+    print(f"[Flux Klein Triple] Import error: {e}")
+    print("[Flux Klein Triple] Please make sure this file is in ComfyUI/custom_nodes/flux_klein_triple/")
 
 class FluxKleinTripleConditioning:
     """
@@ -46,40 +59,48 @@ class FluxKleinTripleConditioning:
     CATEGORY = "flux_klein/conditioning"
     
     def __init__(self):
-        self.device = comfy.model_management.get_torch_device()
+        try:
+            self.device = get_torch_device()
+        except:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     def tensor_to_pil(self, image_tensor):
-        """将tensor转换为PIL图像，不进行任何尺寸修改"""
+        """将tensor转换为PIL图像"""
         try:
+            if image_tensor is None:
+                raise ValueError("Input image tensor is None")
+                
             # 处理批次维度
             if len(image_tensor.shape) == 4:
                 image_tensor = image_tensor.squeeze(0)
             
-            # 确保在CPU上并转换为numpy
+            # 确保在CPU上
             if image_tensor.device != torch.device('cpu'):
                 image_tensor = image_tensor.cpu()
             
             # 转换0-1范围到0-255
             if image_tensor.max() <= 1.0:
-                image_tensor = (image_tensor * 255).clamp(0, 255).byte()
+                image_tensor = (image_tensor * 255).clamp(0, 255)
+            
+            # 转换为byte类型
+            image_tensor = image_tensor.byte()
             
             # 转换为numpy数组
-            if image_tensor.dtype != torch.uint8:
-                image_tensor = image_tensor.byte()
+            image_array = image_tensor.numpy()
             
             # 转换为PIL
-            image_array = image_tensor.numpy()
             if len(image_array.shape) == 3 and image_array.shape[2] == 3:
-                # RGB图像
-                return Image.fromarray(image_array.astype('uint8'), 'RGB')
-            elif len(image_array.shape) == 3 and image_array.shape[2] == 1:
-                # 单通道图像
-                return Image.fromarray(image_array[:, :, 0].astype('uint8'), 'L')
+                return Image.fromarray(image_array, 'RGB')
+            elif len(image_array.shape) == 3 and image_array.shape[2] == 4:
+                return Image.fromarray(image_array, 'RGBA')
+            elif len(image_array.shape) == 2:
+                return Image.fromarray(image_array, 'L')
             else:
-                # 默认处理方式
-                return Image.fromarray(image_array.astype('uint8'))
+                return Image.fromarray(image_array)
+                
         except Exception as e:
-            print(f"Error in tensor_to_pil: {e}")
+            print(f"[Flux Klein Triple] Error converting tensor to PIL: {e}")
+            print(f"Tensor shape: {image_tensor.shape if image_tensor is not None else 'None'}")
             raise
     
     def encode_image_to_latent(self, vae, image_tensor):
@@ -95,32 +116,30 @@ class FluxKleinTripleConditioning:
             image_np = np.array(pil_image).astype(np.float32) / 255.0
             image_torch = torch.from_numpy(image_np).unsqueeze(0).to(self.device)
             
-            # 调整维度顺序 (H, W, C) -> (B, C, H, W)
-            if len(image_torch.shape) == 4:
-                if image_torch.shape[-1] == 3:  # (B, H, W, C)
-                    image_torch = image_torch.permute(0, 3, 1, 2)
-            else:  # (H, W, C) -> (B, C, H, W)
-                image_torch = image_torch.permute(2, 0, 1).unsqueeze(0)
+            # 调整维度顺序
+            if len(image_torch.shape) == 4 and image_torch.shape[-1] == 3:
+                image_torch = image_torch.permute(0, 3, 1, 2)
             
             # 使用VAE编码
             latent = vae.encode(image_torch)
             
             return latent, (width, height)
+            
         except Exception as e:
-            print(f"Error in encode_image_to_latent: {e}")
+            print(f"[Flux Klein Triple] Error encoding image to latent: {e}")
             raise
     
     def encode_prompt_with_images(self, clip, prompt, latent1, latent2, latent3, 
                                    strength2, strength3):
-        """编码提示词并融合图像信息，返回CONDITIONING格式"""
+        """编码提示词并融合图像信息"""
         try:
-            # 构建图像感知的提示词
-            enhanced_prompt = f"[MAIN IMAGE]: Primary content to edit (size: {list(latent1.shape)})\n"
-            enhanced_prompt += f"[REF IMAGE 1]: Reference with strength {strength2}\n"
-            enhanced_prompt += f"[REF IMAGE 2]: Reference with strength {strength3}\n"
+            # 构建增强提示词
+            enhanced_prompt = f"[MAIN]: Edit this image (latent shape: {latent1.shape})\n"
+            enhanced_prompt += f"[REF1]: Apply with strength {strength2}\n"
+            enhanced_prompt += f"[REF2]: Apply with strength {strength3}\n"
             
             if prompt and prompt.strip():
-                enhanced_prompt += f"\n[INSTRUCTION]: {prompt}"
+                enhanced_prompt += f"\n[ TASK ]: {prompt}"
             
             # 使用CLIP编码
             tokens = clip.tokenize(enhanced_prompt)
@@ -129,7 +148,7 @@ class FluxKleinTripleConditioning:
             # 构建CONDITIONING格式
             conditioning = [[cond, {"pooled_output": pooled}]]
             
-            # 添加多参考图像信息到extra_patches
+            # 在extra_patches中存储参考信息
             conditioning[0][1]["extra_patches"] = {
                 "ref_latent_2": {
                     "samples": latent2,
@@ -141,41 +160,43 @@ class FluxKleinTripleConditioning:
                 }
             }
             
-            # 添加主latent的尺寸信息，用于后续解码
+            # 存储主latent信息
             conditioning[0][1]["main_latent_shape"] = list(latent1.shape)
-            conditioning[0][1]["reference_count"] = 2  # 参考图像数量
+            conditioning[0][1]["reference_count"] = 2
             
             return conditioning
+            
         except Exception as e:
-            print(f"Error in encode_prompt_with_images: {e}")
+            print(f"[Flux Klein Triple] Error encoding prompt: {e}")
             raise
     
     def encode_triple_images(self, clip, vae, image1, image2, image3, 
                            prompt="", strength2=1.0, strength3=1.0):
         """主函数：编码三张图像并生成CONDITIONING"""
         try:
-            # 编码三张图像到latent空间
+            print(f"[Flux Klein Triple] Starting encoding...")
+            print(f"[Flux Klein Triple] Device: {self.device}")
+            
+            # 编码三张图像
             latent1_main, size1 = self.encode_image_to_latent(vae, image1)
             latent2_ref, size2 = self.encode_image_to_latent(vae, image2)
             latent3_ref, size3 = self.encode_image_to_latent(vae, image3)
             
-            # 编码提示词并生成CONDITIONING
+            print(f"[Flux Klein Triple] Encoded latents - Main: {size1}, Ref1: {size2}, Ref2: {size3}")
+            
+            # 生成CONDITIONING
             conditioning = self.encode_prompt_with_images(
                 clip, prompt, latent1_main, latent2_ref, latent3_ref, strength2, strength3
             )
             
-            # 在CONDITIONING中存储尺寸信息（用于后续节点）
-            conditioning[0][1]["size_info"] = {
-                "main": size1,
-                "ref1": size2,
-                "ref2": size3
-            }
-            
+            print(f"[Flux Klein Triple] Encoding completed successfully!")
             return (conditioning,)
+            
         except Exception as e:
-            print(f"Error in encode_triple_images: {e}")
+            print(f"[Flux Klein Triple] Error in main encoding function: {e}")
+            import traceback
+            traceback.print_exc()
             raise
-
 
 # 节点注册
 NODE_CLASS_MAPPINGS = {
