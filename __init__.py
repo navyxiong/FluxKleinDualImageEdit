@@ -1,5 +1,5 @@
 # __init__.py
-from .flux_klein_triple_conditioning import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
+from .flux_klein_dual_conditioning import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
 
 __all__ = ['NODE_CLASS_MAPPINGS', 'NODE_DISPLAY_NAME_MAPPINGS']
-print("[Flux Klein Triple] Module loaded successfully!")
+print("[Flux Klein Dual Conditioning] __init__.py loaded successfully!")
