@@ -1,4 +1,4 @@
-# flux_klein_triple_conditioning.py
+# flux_klein_dual_conditioning.py
 import torch
 import numpy as np
 from PIL import Image
@@ -13,13 +13,13 @@ try:
     import folder_paths
     from comfy.model_management import get_torch_device
 except ImportError as e:
-    print(f"[Flux Klein Triple] Import error: {e}")
-    print("[Flux Klein Triple] Please make sure this file is in ComfyUI/custom_nodes/flux_klein_triple/")
+    print(f"[Flux Klein Dual] Import error: {e}")
+    print("[Flux Klein Dual] Please make sure this file is in ComfyUI/custom_nodes/flux_klein_dual/")
 
-class FluxKleinTripleConditioning:
+class FluxKleinDualConditioning:
     """
-    FLUX.2 [klein] 三图条件编码节点
-    image1为必需输入，image2和image3为可选参考图像
+    FLUX.2 [klein] 双图条件编码节点
+    输入clip、vae、image1（必需）、image2（可选）
     仅输出CONDITIONING
     """
     
@@ -32,30 +32,25 @@ class FluxKleinTripleConditioning:
                 "image1": ("IMAGE",),  # 主图像 - 决定输出尺寸
             },
             "optional": {
-                "image2": ("IMAGE",),  # 参考图像1（可选）
-                "image3": ("IMAGE",),  # 参考图像2（可选）
+                "image2": ("IMAGE",),  # 参考图像（可选）
                 "prompt": ("STRING", {
                     "multiline": True, 
                     "default": "基于参考图像进行编辑",
+                    "tooltip": "编辑提示词，描述如何使用参考图像"
                 }),
-                "strength2": ("FLOAT", {
+                "strength": ("FLOAT", {
                     "default": 1.0,
                     "min": 0.0,
                     "max": 2.0,
                     "step": 0.1,
-                }),
-                "strength3": ("FLOAT", {
-                    "default": 1.0,
-                    "min": 0.0,
-                    "max": 2.0,
-                    "step": 0.1,
+                    "tooltip": "image2对生成结果的影响强度"
                 }),
             }
         }
     
     RETURN_TYPES = ("CONDITIONING",)
     RETURN_NAMES = ("conditioning",)
-    FUNCTION = "encode_triple_images"
+    FUNCTION = "encode_dual_images"
     CATEGORY = "flux_klein/conditioning"
     
     def __init__(self):
@@ -92,7 +87,7 @@ class FluxKleinTripleConditioning:
                 return Image.fromarray(image_array.astype('uint8'))
                 
         except Exception as e:
-            print(f"[Flux Klein Triple] Error converting tensor to PIL: {e}")
+            print(f"[Flux Klein Dual] Error converting tensor to PIL: {e}")
             return None
     
     def encode_image_to_latent(self, vae, image_tensor):
@@ -121,22 +116,17 @@ class FluxKleinTripleConditioning:
             return latent, (width, height)
             
         except Exception as e:
-            print(f"[Flux Klein Triple] Error encoding image to latent: {e}")
+            print(f"[Flux Klein Dual] Error encoding image to latent: {e}")
             return None, None
     
-    def encode_prompt_with_images(self, clip, prompt, latent_main, ref_latents):
-        """
-        编码提示词并融合图像信息
-        ref_latents: 字典，格式为 {2: (latent2, strength2), 3: (latent3, strength3)}
-        """
+    def encode_prompt_with_images(self, clip, prompt, latent_main, ref_latent=None, ref_strength=1.0):
+        """编码提示词并融合图像信息"""
         try:
             # 构建增强提示词
-            enhanced_prompt = f"[MAIN]: Edit this image\n"
+            enhanced_prompt = f"[MAIN]: Edit this image (latent shape: {list(latent_main.shape)})\n"
             
-            # 添加参考图像信息
-            for idx, (latent, strength) in ref_latents.items():
-                if latent is not None:
-                    enhanced_prompt += f"[REF{idx}]: Reference with strength {strength}\n"
+            if ref_latent is not None:
+                enhanced_prompt += f"[REF]: Reference with strength {ref_strength}\n"
             
             if prompt and prompt.strip():
                 enhanced_prompt += f"\n[ TASK ]: {prompt}"
@@ -148,37 +138,33 @@ class FluxKleinTripleConditioning:
             # 构建CONDITIONING格式
             conditioning = [[cond, {"pooled_output": pooled}]]
             
-            # 添加参考图像信息到extra_patches
-            extra_patches = {}
-            ref_count = 0
-            
-            for idx, (latent, strength) in ref_latents.items():
-                if latent is not None:
-                    extra_patches[f"ref_latent_{idx}"] = {
-                        "samples": latent,
-                        "strength": strength
+            # 如果有参考图像，添加信息到extra_patches
+            if ref_latent is not None:
+                conditioning[0][1]["extra_patches"] = {
+                    "ref_latent": {
+                        "samples": ref_latent,
+                        "strength": ref_strength
                     }
-                    ref_count += 1
+                }
+                conditioning[0][1]["reference_count"] = 1
+            else:
+                conditioning[0][1]["reference_count"] = 0
             
-            if extra_patches:
-                conditioning[0][1]["extra_patches"] = extra_patches
-            
-            # 存储主latent信息和参考图像数量
-            conditioning[0][1]["main_latent_shape"] = list(latent_main.shape) if latent_main is not None else []
-            conditioning[0][1]["reference_count"] = ref_count
+            # 存储主latent信息
+            conditioning[0][1]["main_latent_shape"] = list(latent_main.shape)
             
             return conditioning
             
         except Exception as e:
-            print(f"[Flux Klein Triple] Error encoding prompt: {e}")
+            print(f"[Flux Klein Dual] Error encoding prompt: {e}")
             raise
     
-    def encode_triple_images(self, clip, vae, image1, image2=None, image3=None, 
-                           prompt="", strength2=1.0, strength3=1.0):
+    def encode_dual_images(self, clip, vae, image1, image2=None, 
+                          prompt="", strength=1.0):
         """主函数：编码图像并生成CONDITIONING"""
         try:
-            print(f"[Flux Klein Triple] Starting encoding...")
-            print(f"[Flux Klein Triple] Device: {self.device}")
+            print(f"[Flux Klein Dual] Starting encoding...")
+            print(f"[Flux Klein Dual] Device: {self.device}")
             
             # 编码主图像（必需）
             latent_main, size_main = self.encode_image_to_latent(vae, image1)
@@ -186,50 +172,44 @@ class FluxKleinTripleConditioning:
                 raise ValueError("Failed to encode main image (image1)")
             
             # 编码可选的参考图像
-            ref_latents = {}
-            
+            ref_latent = None
             if image2 is not None:
-                latent2, size2 = self.encode_image_to_latent(vae, image2)
-                if latent2 is not None:
-                    ref_latents[2] = (latent2, strength2)
-                    print(f"[Flux Klein Triple] Image2 encoded, size: {size2}")
-            
-            if image3 is not None:
-                latent3, size3 = self.encode_image_to_latent(vae, image3)
-                if latent3 is not None:
-                    ref_latents[3] = (latent3, strength3)
-                    print(f"[Flux Klein Triple] Image3 encoded, size: {size3}")
+                ref_latent, size_ref = self.encode_image_to_latent(vae, image2)
+                if ref_latent is not None:
+                    print(f"[Flux Klein Dual] Reference image encoded")
             
             # 生成CONDITIONING
             conditioning = self.encode_prompt_with_images(
-                clip, prompt, latent_main, ref_latents
+                clip, prompt, latent_main, ref_latent, strength
             )
             
             # 存储尺寸信息
-            size_info = {"main": size_main}
-            if 2 in ref_latents:
-                size_info["ref1"] = size_main  # 占位
-            if 3 in ref_latents:
-                size_info["ref2"] = size_main  # 占位
-            conditioning[0][1]["size_info"] = size_info
+            conditioning[0][1]["size_info"] = {
+                "main": size_main,
+                "has_reference": ref_latent is not None
+            }
             
-            print(f"[Flux Klein Triple] Encoding completed! Reference images: {len(ref_latents)}")
+            ref_status = "with reference" if ref_latent is not None else "no reference"
+            print(f"[Flux Klein Dual] Encoding completed {ref_status}!")
             return (conditioning,)
             
         except Exception as e:
-            print(f"[Flux Klein Triple] Error in main encoding function: {e}")
+            print(f"[Flux Klein Dual] Error in main encoding function: {e}")
             import traceback
             traceback.print_exc()
             raise
 
 # 节点注册
 NODE_CLASS_MAPPINGS = {
-    "FluxKleinTripleConditioning": FluxKleinTripleConditioning,
+    "FluxKleinDualConditioning": FluxKleinDualConditioning,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "FluxKleinTripleConditioning": "Flux Klein Triple Conditioning",
+    "FluxKleinDualConditioning": "Flux Klein Dual Conditioning",
 }
 
 # 确保模块级别的导入正确
 __all__ = ['NODE_CLASS_MAPPINGS', 'NODE_DISPLAY_NAME_MAPPINGS']
+
+# 打印加载信息
+print("[Flux Klein Dual Conditioning] Node module loaded successfully!")
