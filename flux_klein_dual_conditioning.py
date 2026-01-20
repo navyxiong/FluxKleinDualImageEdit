@@ -22,7 +22,6 @@ class FluxKleinDualConditioning:
     FLUX.2 [klein] 双图条件编码节点
     输入clip、vae、image1（必需）、image2（可选）
     仅输出CONDITIONING
-    自动调整尺寸为32的倍数
     """
     
     @classmethod
@@ -60,60 +59,79 @@ class FluxKleinDualConditioning:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"[Flux Klein Dual] Device: {self.device}")
     
+    def get_vae_device(self, vae):
+        """
+        安全获取VAE设备的方法
+        兼容不同的VAE对象类型
+        """
+        try:
+            # 方法1: 尝试直接访问device属性
+            if hasattr(vae, 'device'):
+                return vae.device
+        except:
+            pass
+        
+        try:
+            # 方法2: 尝试访问内部VAE模型
+            if hasattr(vae, 'vae') and hasattr(vae.vae, 'device'):
+                return vae.vae.device
+        except:
+            pass
+        
+        try:
+            # 方法3: 尝试parameters()方法（标准PyTorch）
+            return next(vae.parameters()).device
+        except:
+            pass
+        
+        try:
+            # 方法4: 尝试访问第一个参数
+            for param in vae.parameters():
+                return param.device
+        except:
+            pass
+        
+        # 方法5: 返回默认设备（最安全）
+        print(f"[Flux Klein Dual] [get_vae_device] Could not detect VAE device, using default: {self.device}")
+        return self.device
+    
     def normalize_image_tensor(self, image_tensor):
-        """
-        规范化图像张量，确保是3通道RGB格式
-        """
+        """规范化图像张量，确保是3通道RGB格式"""
         try:
             if image_tensor is None:
                 raise ValueError("Input tensor is None")
             
-            print(f"[Flux Klein Dual] [normalize] Input shape: {image_tensor.shape}, dtype: {image_tensor.dtype}")
-            
             # 处理批次维度
             if len(image_tensor.shape) == 4:
-                if image_tensor.shape[0] > 1:
-                    print(f"[Flux Klein Dual] [normalize] Warning: Batch size > 1, using first image")
                 image_tensor = image_tensor.squeeze(0)
             
-            # 确保在CPU上便于处理
+            # 确保在CPU上
             if image_tensor.device != torch.device('cpu'):
                 image_tensor = image_tensor.cpu()
             
-            # 确保数值范围在0-1
+            # 归一化到0-1
             if image_tensor.max() > 1.0:
-                print(f"[Flux Klein Dual] [normalize] Warning: Values > 1.0 detected, normalizing")
                 image_tensor = torch.clamp(image_tensor, 0, 255) / 255.0
             elif image_tensor.min() < 0.0:
-                print(f"[Flux Klein Dual] [normalize] Warning: Negative values detected, clamping")
                 image_tensor = torch.clamp(image_tensor, 0, 1.0)
             
-            # 处理通道维度
+            # 处理通道
             if len(image_tensor.shape) == 2:
-                # 灰度图 -> RGB
-                print(f"[Flux Klein Dual] [normalize] Converting grayscale to RGB")
                 image_tensor = image_tensor.unsqueeze(-1).repeat(1, 1, 3)
             elif len(image_tensor.shape) == 3:
                 channels = image_tensor.shape[2]
                 if channels == 1:
-                    # 单通道 -> RGB
-                    print(f"[Flux Klein Dual] [normalize] Converting single channel to RGB")
                     image_tensor = image_tensor.repeat(1, 1, 3)
                 elif channels == 4:
-                    # RGBA -> RGB (移除alpha通道)
-                    print(f"[Flux Klein Dual] [normalize] Converting RGBA to RGB")
                     image_tensor = image_tensor[:, :, :3]
                 elif channels == 3:
-                    # 已经是RGB，无需处理
                     pass
                 else:
                     raise ValueError(f"Unsupported channel count: {channels}")
-            else:
-                raise ValueError(f"Unsupported tensor dimensions: {len(image_tensor.shape)}")
             
-            # 最终验证
+            # 验证
             if len(image_tensor.shape) != 3 or image_tensor.shape[2] != 3:
-                raise ValueError(f"Final tensor shape is incorrect: {image_tensor.shape}")
+                raise ValueError(f"Final shape incorrect: {image_tensor.shape}")
             
             return image_tensor
             
@@ -122,75 +140,72 @@ class FluxKleinDualConditioning:
             return None
     
     def tensor_to_pil(self, image_tensor):
-        """将tensor转换为PIL图像（使用规范化后的张量）"""
+        """将tensor转换为PIL图像"""
         try:
-            print(f"[Flux Klein Dual] [to_pil] Starting conversion...")
-            
-            # 先规范化张量
             normalized_tensor = self.normalize_image_tensor(image_tensor)
             if normalized_tensor is None:
                 return None
             
-            # 转换到0-255范围
             image_tensor = (normalized_tensor * 255).clamp(0, 255).byte()
-            
-            # 转换为numpy
             image_array = image_tensor.numpy()
-            
-            # 转换为PIL
             pil_image = Image.fromarray(image_array, 'RGB')
-            print(f"[Flux Klein Dual] [to_pil] Success - PIL size: {pil_image.size}")
             return pil_image
                 
         except Exception as e:
             print(f"[Flux Klein Dual] [to_pil] ERROR: {e}")
             return None
     
-    def resize_for_vae(self, image_tensor):
+    def pad_to_multiple(self, image_tensor, multiple=32, min_size=128):
         """
-        关键修复：调整图像尺寸为32的倍数
-        这是解决VAE编码失败的必要步骤
+        使用填充(padding)而不是缩放，避免质量损失
         """
         try:
-            print(f"[Flux Klein Dual] [resize] Checking VAE compatibility...")
-            
-            # 假设输入是(B, C, H, W)或(C, H, W)格式
+            # 获取维度
             if len(image_tensor.shape) == 4:
                 batch, channels, height, width = image_tensor.shape
             elif len(image_tensor.shape) == 3:
                 channels, height, width = image_tensor.shape
-                image_tensor = image_tensor.unsqueeze(0)  # 添加batch维度
+                image_tensor = image_tensor.unsqueeze(0)
                 batch = 1
             else:
-                raise ValueError(f"Unexpected tensor shape: {image_tensor.shape}")
+                raise ValueError(f"Unexpected shape: {image_tensor.shape}")
             
-            print(f"[Flux Klein Dual] [resize] Original size: {height}x{width}")
+            print(f"[Flux Klein Dual] [pad] Original size: {height}x{width}")
             
-            # 计算32的倍数尺寸（向上取整）
-            new_height = ((height + 31) // 32) * 32
-            new_width = ((width + 31) // 32) * 32
+            # 计算目标尺寸：确保是32的倍数且不小于128
+            target_height = max(min_size, ((height + multiple - 1) // multiple) * multiple)
+            target_width = max(min_size, ((width + multiple - 1) // multiple) * multiple)
             
-            if new_height != height or new_width != width:
-                print(f"[Flux Klein Dual] [resize] Resizing for VAE: {height}x{width} -> {new_height}x{new_width}")
-                resized_tensor = torch.nn.functional.interpolate(
-                    image_tensor, size=(new_height, new_width), mode='bilinear', align_corners=False
+            if target_height != height or target_width != width:
+                # 计算需要填充的尺寸
+                pad_height = target_height - height
+                pad_width = target_width - width
+                
+                # 使用reflect填充避免边缘异常
+                padded_tensor = torch.nn.functional.pad(
+                    image_tensor,
+                    (0, pad_width, 0, pad_height),  # (left, right, top, bottom)
+                    mode='reflect'
                 )
-                return resized_tensor, (height, width)  # 返回新张量和原始尺寸
+                
+                print(f"[Flux Klein Dual] [pad] Padded: {height}x{width} -> {target_height}x{target_width}")
+                
+                return padded_tensor, (height, width)
             else:
-                print(f"[Flux Klein Dual] [resize] Size is already VAE-compatible")
+                print(f"[Flux Klein Dual] [pad] No padding needed")
                 return image_tensor, (height, width)
                 
         except Exception as e:
-            print(f"[Flux Klein Dual] [resize] ERROR: {e}")
+            print(f"[Flux Klein Dual] [pad] ERROR: {e}")
             return None, None
     
     def encode_image_to_latent(self, vae, image_tensor):
-        """将图像编码为latent，自动调整尺寸以满足VAE要求"""
+        """将图像编码为latent，使用填充确保VAE兼容性"""
         try:
-            print(f"[Flux Klein Dual] [encode] Encoding image to latent...")
+            print(f"[Flux Klein Dual] [encode] Starting encoding...")
             
             if image_tensor is None:
-                raise ValueError("Input image_tensor is None")
+                raise ValueError("Input tensor is None")
             
             pil_image = self.tensor_to_pil(image_tensor)
             if pil_image is None:
@@ -198,31 +213,32 @@ class FluxKleinDualConditioning:
             
             orig_width, orig_height = pil_image.size
             
-            # 转换为tensor
+            # 转换为tensor (B, C, H, W)
             image_np = np.array(pil_image).astype(np.float32) / 255.0
             image_torch = torch.from_numpy(image_np).unsqueeze(0).to(self.device)
+            image_torch = image_torch.permute(0, 3, 1, 2)  # (B, H, W, C) -> (B, C, H, W)
             
-            # 调整维度顺序
-            if len(image_torch.shape) == 4 and image_torch.shape[-1] == 3:
-                image_torch = image_torch.permute(0, 3, 1, 2)
-            
-            # 确保VAE在正确设备上
-            vae_device = next(vae.parameters()).device
+            # 关键修复：安全获取VAE设备
+            vae_device = self.get_vae_device(vae)
             image_torch = image_torch.to(vae_device)
             
-            # 关键修复：确保尺寸是32的倍数
-            image_torch, original_size = self.resize_for_vae(image_torch)
-            if image_torch is None:
-                raise ValueError("Failed to resize image for VAE")
+            print(f"[Flux Klein Dual] [encode] Before padding: {image_torch.shape}")
+            print(f"[Flux Klein Dual] [encode] Using VAE device: {vae_device}")
             
-            print(f"[Flux Klein Dual] [encode] Final VAE input shape: {image_torch.shape}")
+            # 填充到32的倍数
+            image_torch, original_size = self.pad_to_multiple(image_torch, multiple=32, min_size=128)
+            
+            if image_torch is None:
+                raise ValueError("Failed to pad image for VAE")
+            
+            print(f"[Flux Klein Dual] [encode] After padding: {image_torch.shape}")
             
             # 使用VAE编码
             latent = vae.encode(image_torch)
             
             print(f"[Flux Klein Dual] [encode] SUCCESS - Latent shape: {latent.shape}")
             
-            # 返回latent和原始图像尺寸（用于后续解码）
+            # 返回latent和原始图像尺寸
             return latent, (orig_width, orig_height)
             
         except Exception as e:
@@ -234,17 +250,13 @@ class FluxKleinDualConditioning:
     def encode_prompt_with_images(self, clip, prompt, latent_main, ref_latent=None, ref_strength=1.0):
         """编码提示词并融合图像信息"""
         try:
-            print(f"[Flux Klein Dual] [prompt] Encoding prompt...")
-            print(f"[Flux Klein Dual] [prompt] Main latent shape: {latent_main.shape}")
-            print(f"[Flux Klein Dual] [prompt] Has reference: {ref_latent is not None}")
-            
-            enhanced_prompt = f"[MAIN]: Edit this image (latent shape: {list(latent_main.shape)})\n"
+            enhanced_prompt = f"[MAIN]: Edit image (shape: {list(latent_main.shape)})\n"
             
             if ref_latent is not None:
-                enhanced_prompt += f"[REF]: Reference with strength {ref_strength}\n"
+                enhanced_prompt += f"[REF]: Strength {ref_strength}\n"
             
             if prompt and prompt.strip():
-                enhanced_prompt += f"\n[ TASK ]: {prompt}"
+                enhanced_prompt += f"\n[TASK]: {prompt}"
             
             tokens = clip.tokenize(enhanced_prompt)
             cond, pooled = clip.encode_from_tokens(tokens, return_pooled=True)
@@ -264,7 +276,6 @@ class FluxKleinDualConditioning:
             
             conditioning[0][1]["main_latent_shape"] = list(latent_main.shape)
             
-            print(f"[Flux Klein Dual] [prompt] SUCCESS")
             return conditioning
             
         except Exception as e:
@@ -276,36 +287,32 @@ class FluxKleinDualConditioning:
         """主函数：编码图像并生成CONDITIONING"""
         try:
             print("\n" + "="*60)
-            print("FLUX KLEIN DUAL CONDITIONING - EXECUTION START")
+            print("FLUX KLEIN DUAL CONDITIONING - START")
             print("="*60)
             
             # 编码主图像
-            print("Step 1: Encoding MAIN image (image1)...")
-            print(f"  image1 shape: {image1.shape if hasattr(image1, 'shape') else 'No shape'}")
-            
+            print("Step 1: Encoding MAIN image...")
             latent_main, size_main = self.encode_image_to_latent(vae, image1)
             
             if latent_main is None:
-                print("\n❌ FATAL: Failed to encode main image")
+                print("\n❌ FATAL: Main image encoding failed")
                 print("="*60)
-                raise ValueError("Failed to encode main image (image1) - See logs above")
+                raise ValueError("Failed to encode main image (image1)")
             
-            print(f"✓ SUCCESS: Main latent shape: {latent_main.shape}")
+            print(f"✓ SUCCESS: Main latent {latent_main.shape}")
             
             # 编码参考图像
             ref_latent = None
             if image2 is not None:
-                print("\nStep 2: Encoding REFERENCE image (image2)...")
-                print(f"  image2 shape: {image2.shape if hasattr(image2, 'shape') else 'No shape'}")
-                
+                print("\nStep 2: Encoding REFERENCE image...")
                 ref_latent, _ = self.encode_image_to_latent(vae, image2)
                 
                 if ref_latent is not None:
-                    print(f"✓ SUCCESS: Reference latent shape: {ref_latent.shape}")
+                    print(f"✓ SUCCESS: Ref latent {ref_latent.shape}")
                 else:
-                    print("⚠ Warning: Failed to encode image2, will proceed without reference")
+                    print("⚠ Warning: image2 encoding failed, will proceed without it")
             else:
-                print("\nStep 2: SKIPPED - No image2 provided")
+                print("\nStep 2: SKIPPED - No image2")
             
             # 生成CONDITIONING
             print("\nStep 3: Encoding prompt...")
@@ -320,10 +327,9 @@ class FluxKleinDualConditioning:
             }
             
             print("\n" + "="*60)
-            print("✅ ENCODING COMPLETED SUCCESSFULLY!")
-            print(f"   - Main latent: {latent_main.shape}")
-            print(f"   - Reference: {'Yes' if ref_latent is not None else 'No'}")
-            print(f"   - Strength: {strength if ref_latent is not None else 'N/A'}")
+            print("✅ ENCODING COMPLETED!")
+            print(f"   Main: {latent_main.shape}")
+            print(f"   Ref: {'Yes' if ref_latent is not None else 'No'}")
             print("="*60 + "\n")
             
             return (conditioning,)
@@ -352,6 +358,6 @@ try:
     print("[Flux Klein Dual] Node registered successfully!")
     
 except Exception as e:
-    print(f"[Flux Klein Dual] ERROR during node registration: {e}")
+    print(f"[Flux Klein Dual] ERROR during registration: {e}")
     import traceback
     traceback.print_exc()
