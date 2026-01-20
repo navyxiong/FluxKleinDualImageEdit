@@ -5,7 +5,6 @@ from PIL import Image
 import sys
 import os
 
-# 添加调试信息
 print("[Flux Klein Dual] Loading module...")
 
 # 确保能导入comfy相关模块
@@ -17,7 +16,6 @@ try:
     print("[Flux Klein Dual] Comfy imports successful!")
 except ImportError as e:
     print(f"[Flux Klein Dual] Import error: {e}")
-    print("[Flux Klein Dual] Please make sure this file is in ComfyUI/custom_nodes/flux_klein_dual/")
 
 class FluxKleinDualConditioning:
     """
@@ -66,20 +64,31 @@ class FluxKleinDualConditioning:
         """将tensor转换为PIL图像"""
         try:
             if image_tensor is None:
+                print("[Flux Klein Dual] ERROR: Input tensor is None")
                 return None
                 
+            print(f"[Flux Klein Dual] Converting tensor to PIL - Shape: {image_tensor.shape}, Dtype: {image_tensor.dtype}, Device: {image_tensor.device}, Max: {image_tensor.max()}")
+            
+            # 处理批次维度
             if len(image_tensor.shape) == 4:
+                if image_tensor.shape[0] > 1:
+                    print("[Flux Klein Dual] WARNING: Batch size > 1, using first image")
                 image_tensor = image_tensor.squeeze(0)
             
+            # 确保在CPU上
             if image_tensor.device != torch.device('cpu'):
                 image_tensor = image_tensor.cpu()
             
+            # 转换0-1范围到0-255
             if image_tensor.max() <= 1.0:
                 image_tensor = (image_tensor * 255).clamp(0, 255)
             
             image_tensor = image_tensor.byte()
             image_array = image_tensor.numpy()
             
+            print(f"[Flux Klein Dual] Final array shape: {image_array.shape}, dtype: {image_array.dtype}")
+            
+            # 转换为PIL
             if len(image_array.shape) == 3 and image_array.shape[2] == 3:
                 return Image.fromarray(image_array.astype('uint8'), 'RGB')
             elif len(image_array.shape) == 3 and image_array.shape[2] == 4:
@@ -87,21 +96,30 @@ class FluxKleinDualConditioning:
             elif len(image_array.shape) == 2:
                 return Image.fromarray(image_array.astype('uint8'), 'L')
             else:
+                print(f"[Flux Klein Dual] WARNING: Unusual array shape {image_array.shape}, attempting conversion")
                 return Image.fromarray(image_array.astype('uint8'))
                 
         except Exception as e:
-            print(f"[Flux Klein Dual] Error converting tensor to PIL: {e}")
+            print(f"[Flux Klein Dual] ERROR in tensor_to_pil: {e}")
+            import traceback
+            traceback.print_exc()
             return None
     
     def encode_image_to_latent(self, vae, image_tensor):
         """将图像编码为latent"""
         try:
             if image_tensor is None:
+                print("[Flux Klein Dual] ERROR: encode_image_to_latent received None tensor")
                 return None, None
                 
+            print(f"[Flux Klein Dual] Encoding image tensor - Shape: {image_tensor.shape}")
+            
             pil_image = self.tensor_to_pil(image_tensor)
             if pil_image is None:
+                print("[Flux Klein Dual] ERROR: tensor_to_pil returned None")
                 return None, None
+            
+            print(f"[Flux Klein Dual] PIL image size: {pil_image.size}")
             
             width, height = pil_image.size
             
@@ -109,22 +127,34 @@ class FluxKleinDualConditioning:
             image_np = np.array(pil_image).astype(np.float32) / 255.0
             image_torch = torch.from_numpy(image_np).unsqueeze(0).to(self.device)
             
+            print(f"[Flux Klein Dual] Torch tensor shape: {image_torch.shape}")
+            
             # 调整维度顺序
             if len(image_torch.shape) == 4 and image_torch.shape[-1] == 3:
                 image_torch = image_torch.permute(0, 3, 1, 2)
             
+            print(f"[Flux Klein Dual] Final tensor shape for VAE: {image_torch.shape}")
+            
             # 使用VAE编码
             latent = vae.encode(image_torch)
+            
+            print(f"[Flux Klein Dual] VAE encoding successful - Latent shape: {latent.shape}")
             
             return latent, (width, height)
             
         except Exception as e:
-            print(f"[Flux Klein Dual] Error encoding image to latent: {e}")
+            print(f"[Flux Klein Dual] ERROR in encode_image_to_latent: {e}")
+            import traceback
+            traceback.print_exc()
             return None, None
     
     def encode_prompt_with_images(self, clip, prompt, latent_main, ref_latent=None, ref_strength=1.0):
         """编码提示词并融合图像信息"""
         try:
+            print(f"[Flux Klein Dual] Encoding prompt...")
+            print(f"[Flux Klein Dual] Main latent shape: {latent_main.shape}")
+            print(f"[Flux Klein Dual] Has reference: {ref_latent is not None}")
+            
             # 构建增强提示词
             enhanced_prompt = f"[MAIN]: Edit this image (latent shape: {list(latent_main.shape)})\n"
             
@@ -133,6 +163,8 @@ class FluxKleinDualConditioning:
             
             if prompt and prompt.strip():
                 enhanced_prompt += f"\n[ TASK ]: {prompt}"
+            
+            print(f"[Flux Klein Dual] Enhanced prompt: {enhanced_prompt[:100]}...")
             
             # 使用CLIP编码
             tokens = clip.tokenize(enhanced_prompt)
@@ -156,34 +188,61 @@ class FluxKleinDualConditioning:
             # 存储主latent信息
             conditioning[0][1]["main_latent_shape"] = list(latent_main.shape)
             
+            print("[Flux Klein Dual] Prompt encoding successful!")
             return conditioning
             
         except Exception as e:
-            print(f"[Flux Klein Dual] Error encoding prompt: {e}")
+            print(f"[Flux Klein Dual] ERROR in encode_prompt_with_images: {e}")
             raise
     
     def encode_dual_images(self, clip, vae, image1, image2=None, 
                           prompt="", strength=1.0):
         """主函数：编码图像并生成CONDITIONING"""
         try:
-            print(f"[Flux Klein Dual] Starting encoding...")
+            print("\n" + "="*50)
+            print("[Flux Klein Dual] STARTING ENCODING PROCESS")
+            print("="*50)
             
             # 编码主图像（必需）
+            print(f"[Flux Klein Dual] Step 1: Encoding main image (image1)")
+            print(f"[Flux Klein Dual] image1 type: {type(image1)}")
+            print(f"[Flux Klein Dual] image1 shape: {image1.shape if hasattr(image1, 'shape') else 'No shape attribute'}")
+            
             latent_main, size_main = self.encode_image_to_latent(vae, image1)
+            
             if latent_main is None:
-                raise ValueError("Failed to encode main image (image1)")
+                print(f"[Flux Klein Dual] ERROR: Failed to encode main image")
+                print(f"[Flux Klein Dual] This usually means:")
+                print(f"[Flux Klein Dual] 1. image1 is not a valid tensor")
+                print(f"[Flux Klein Dual] 2. image1 has wrong format (not RGB)")
+                print(f"[Flux Klein Dual] 3. VAE encoding failed")
+                raise ValueError("Failed to encode main image (image1) - See console for details")
+            
+            print(f"[Flux Klein Dual] Step 1: SUCCESS - Main latent shape: {latent_main.shape}")
             
             # 编码可选的参考图像
             ref_latent = None
             if image2 is not None:
+                print(f"[Flux Klein Dual] Step 2: Encoding reference image (image2)")
+                print(f"[Flux Klein Dual] image2 type: {type(image2)}")
+                print(f"[Flux Klein Dual] image2 shape: {image2.shape if hasattr(image2, 'shape') else 'No shape attribute'}")
+                
                 ref_latent, _ = self.encode_image_to_latent(vae, image2)
+                
                 if ref_latent is not None:
-                    print(f"[Flux Klein Dual] Reference image encoded")
+                    print(f"[Flux Klein Dual] Step 2: SUCCESS - Reference latent shape: {ref_latent.shape}")
+                else:
+                    print(f"[Flux Klein Dual] Step 2: SKIPPED - Could not encode image2")
+            else:
+                print(f"[Flux Klein Dual] Step 2: SKIPPED - No image2 provided")
             
             # 生成CONDITIONING
+            print(f"[Flux Klein Dual] Step 3: Encoding prompt")
             conditioning = self.encode_prompt_with_images(
                 clip, prompt, latent_main, ref_latent, strength
             )
+            
+            print(f"[Flux Klein Dual] Step 3: SUCCESS")
             
             # 存储尺寸信息
             conditioning[0][1]["size_info"] = {
@@ -191,17 +250,21 @@ class FluxKleinDualConditioning:
                 "has_reference": ref_latent is not None
             }
             
-            ref_status = "with reference" if ref_latent is not None else "no reference"
-            print(f"[Flux Klein Dual] Encoding completed {ref_status}!")
+            print("\n" + "="*50)
+            print(f"[Flux Klein Dual] ENCODING COMPLETED SUCCESSFULLY!")
+            print("="*50 + "\n")
+            
             return (conditioning,)
             
         except Exception as e:
-            print(f"[Flux Klein Dual] Error in main encoding function: {e}")
+            print("\n" + "="*50)
+            print(f"[Flux Klein Dual] FATAL ERROR: {e}")
+            print("="*50)
             import traceback
             traceback.print_exc()
             raise
 
-# 节点注册（最关键的部分）
+# 节点注册
 try:
     NODE_CLASS_MAPPINGS = {
         "FluxKleinDualConditioning": FluxKleinDualConditioning,
@@ -217,6 +280,6 @@ try:
     print(f"[Flux Klein Dual] Available nodes: {list(NODE_CLASS_MAPPINGS.keys())}")
     
 except Exception as e:
-    print(f"[Flux Klein Dual] Error registering node: {e}")
+    print(f"[Flux Klein Dual] ERROR during node registration: {e}")
     import traceback
     traceback.print_exc()
