@@ -5,13 +5,16 @@ from PIL import Image
 import sys
 import os
 
+# 添加调试信息
+print("[Flux Klein Dual] Loading module...")
+
 # 确保能导入comfy相关模块
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..'))
 
 try:
     import comfy.model_management
-    import folder_paths
     from comfy.model_management import get_torch_device
+    print("[Flux Klein Dual] Comfy imports successful!")
 except ImportError as e:
     print(f"[Flux Klein Dual] Import error: {e}")
     print("[Flux Klein Dual] Please make sure this file is in ComfyUI/custom_nodes/flux_klein_dual/")
@@ -29,21 +32,19 @@ class FluxKleinDualConditioning:
             "required": {
                 "clip": ("CLIP",),
                 "vae": ("VAE",),
-                "image1": ("IMAGE",),  # 主图像 - 决定输出尺寸
+                "image1": ("IMAGE",),
             },
             "optional": {
-                "image2": ("IMAGE",),  # 参考图像（可选）
+                "image2": ("IMAGE",),
                 "prompt": ("STRING", {
                     "multiline": True, 
                     "default": "基于参考图像进行编辑",
-                    "tooltip": "编辑提示词，描述如何使用参考图像"
                 }),
                 "strength": ("FLOAT", {
                     "default": 1.0,
                     "min": 0.0,
                     "max": 2.0,
                     "step": 0.1,
-                    "tooltip": "image2对生成结果的影响强度"
                 }),
             }
         }
@@ -56,8 +57,10 @@ class FluxKleinDualConditioning:
     def __init__(self):
         try:
             self.device = get_torch_device()
+            print(f"[Flux Klein Dual] Device initialized: {self.device}")
         except:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            print(f"[Flux Klein Dual] Fallback device: {self.device}")
     
     def tensor_to_pil(self, image_tensor):
         """将tensor转换为PIL图像"""
@@ -164,7 +167,6 @@ class FluxKleinDualConditioning:
         """主函数：编码图像并生成CONDITIONING"""
         try:
             print(f"[Flux Klein Dual] Starting encoding...")
-            print(f"[Flux Klein Dual] Device: {self.device}")
             
             # 编码主图像（必需）
             latent_main, size_main = self.encode_image_to_latent(vae, image1)
@@ -174,7 +176,7 @@ class FluxKleinDualConditioning:
             # 编码可选的参考图像
             ref_latent = None
             if image2 is not None:
-                ref_latent, size_ref = self.encode_image_to_latent(vae, image2)
+                ref_latent, _ = self.encode_image_to_latent(vae, image2)
                 if ref_latent is not None:
                     print(f"[Flux Klein Dual] Reference image encoded")
             
@@ -199,17 +201,22 @@ class FluxKleinDualConditioning:
             traceback.print_exc()
             raise
 
-# 节点注册
-NODE_CLASS_MAPPINGS = {
-    "FluxKleinDualConditioning": FluxKleinDualConditioning,
-}
+# 节点注册（最关键的部分）
+try:
+    NODE_CLASS_MAPPINGS = {
+        "FluxKleinDualConditioning": FluxKleinDualConditioning,
+    }
 
-NODE_DISPLAY_NAME_MAPPINGS = {
-    "FluxKleinDualConditioning": "Flux Klein Dual Conditioning",
-}
+    NODE_DISPLAY_NAME_MAPPINGS = {
+        "FluxKleinDualConditioning": "Flux Klein Dual Conditioning",
+    }
 
-# 确保模块级别的导入正确
-__all__ = ['NODE_CLASS_MAPPINGS', 'NODE_DISPLAY_NAME_MAPPINGS']
-
-# 打印加载信息
-print("[Flux Klein Dual Conditioning] Node module loaded successfully!")
+    __all__ = ['NODE_CLASS_MAPPINGS', 'NODE_DISPLAY_NAME_MAPPINGS']
+    
+    print("[Flux Klein Dual] Node class mappings registered successfully!")
+    print(f"[Flux Klein Dual] Available nodes: {list(NODE_CLASS_MAPPINGS.keys())}")
+    
+except Exception as e:
+    print(f"[Flux Klein Dual] Error registering node: {e}")
+    import traceback
+    traceback.print_exc()
